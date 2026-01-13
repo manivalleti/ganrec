@@ -18,6 +18,149 @@ class TomoRadon:
         sino = tf.reshape(sino, [sino.shape[0], sino.shape[1], sino.shape[2], 1])
         return sino
 
+    
+class TomoRadon1:
+    """This is similar to the Radon transformation implemented in the TomoRadon Class
+    Only difference being how angle zero is interepreted 
+    For this class 0 degrees is along the path of the X-ray 
+    which is different from skimage Radon transformation and the TomoRadon Class"""
+
+    def __init__(self, rec, ang, reduce_mode = 'mean'):
+        self.rec = rec
+        self.ang = ang
+        self.mode = reduce_mode
+        
+    def compute(self):
+        nang = self.ang.shape[0]
+
+        # Deals with one channel at a time, a work around to operate on multi channel images
+        channels = tf.split(self.rec, num_or_size_splits=self.rec.shape[-1], axis=-1)
+        sinos = []
+        for chn in channels:
+            img = tf.transpose(chn, [3, 1, 2, 0])
+            img = tf.tile(img, [nang, 1, 1, 1])
+            img = tfrotate(img, self.ang, interpolation="bilinear")
+            if self.mode == 'mean':
+                sino = tf.reduce_mean(img, 2, name=None)
+            elif self.mode == 'sum':
+                sino = tf.reduce_sum(img, 2, name=None)
+            sino = tf.transpose(sino, [2, 0, 1])
+            sinos.append(tf.reshape(sino, [sino.shape[0], sino.shape[1], sino.shape[2], 1]))
+        return tf.concat(sinos, -1)
+
+
+class TomoFluoroLIX:
+    """Fluoroscence Tomography where Absorption Correction is pre computed"""
+
+    def __init__(self, rec, ang,  
+                 Ain = None,
+                 Pout = None,
+                 reduce_mode = 'mean'):
+        
+        self.rec = rec
+        self.ang = ang
+        self.mode = reduce_mode
+        self.Ain = Ain
+        self.Pout = Pout
+
+    def compute(self):
+        nang = self.ang.shape[0]
+        img = tf.transpose(self.rec, [3, 1, 2, 0])
+        img = tf.tile(img, [nang, 1, 1, 1])
+        img = tfrotate(img, self.ang, center = self.cen, interpolation="bilinear")
+
+        if self.Ain is not None:
+            img = tf.math.multiply(img, self.Ain)
+        
+        if self.Pout is not None:
+            img = tf.math.multiply(img, self.Pout)
+
+        if self.mode == 'mean':
+            sino = tf.reduce_mean(img, 2, name=None)
+        elif self.mode == 'sum':
+            sino = tf.reduce_sum(img, 2, name=None)
+        sino = tf.transpose(sino, [2, 0, 1])
+        sino = tf.reshape(sino, [sino.shape[0], sino.shape[1], sino.shape[2], 1])
+        return sino
+
+    
+class TomoFluoroHXN:
+    """Fluoroscence Tomography with on the fly Absorption Corrections"""
+    def __init__(self, rec, ang, incident_map, emission_map, 
+                 emission_kernel,
+                 pix = 1., 
+                 reduce_mode = 'mean'):
+        self.rec = rec      # Concetrations Reconstructions i.e., the output of the NN, shape: [B, H, W, C]
+        self.inc = incident_map # attenuation coefficients for incident energy, shape: [B, H, W, C]
+        self.ems = emission_map     # attenuation coefficients for emission energy, shape: [B, H, W, C]
+        self.ang = ang      # Array of angles, shape: [nang, 1] or [nang,]
+        self.pix = pix      # Float, pixel size in cms
+        # Kernel corresponds to the weights inside the cone of emission, [kH ~= 2*H, kW, C_in = 1, Cout = 1]
+        self.krnl = emission_kernel     
+        self.reduce_mode = reduce_mode
+
+
+    def compute(self):
+        
+        nang = self.ang.shape[0]
+
+        ######## Incident Attenuation ########
+        # We will start with the incident attenuation
+        inc = tf.transpose(self.inc, [3,1,2,0])      # [C=1, H, W, B=1]
+        inc = tf.tile(inc, [nang,1,1,1])            # [Nang, H, W, B=1]
+        inc = tfrotate(inc, self.ang, interpolation = "bilinear")      # [Nang, H, W, B=1]
+        inc = tf.transpose(inc, [3,0,1,2])      # [B=1, Nang, H, W]
+
+        inc_mudl = inc*self.pix          # Incident mu.dl per pixel for every angle
+
+        # This gives you the summation of mu.dl until that pixel along the incident ray
+        tau_inc = tf.cumsum(inc_mudl, axis = -1, exclusive=True)     # sum(mu.dl), [B = 1, Nang, H, W]
+        tau_inc = tf.clip_by_value(tau_inc, 0.0, 200.0)      #Numerical stability
+
+        A_in = tf.exp(-tau_inc)    # exp(-sum(mu.dl))  [B = 1, Nang, H, W]
+
+        # consistency so A_in and P_out shapes stay the same
+        A_in = A_in[0,...,None]     # [Nang, H, W, C = 1], 
+
+
+        ######## Emission Attenuation ########
+        ems = tf.transpose(self.ems, [3,1,2,0])      # [C=1, H, W, B=1]
+        ems = tf.tile(ems, [nang,1,1,1])             # [Nang, H, W, B=1]
+        ems = tfrotate(ems, self.ang, interpolation = "bilinear")      # [Nang, H, W, B=1]
+        ems = tf.transpose(ems, [3,0,1,2])      # [B=1, Nang, H, W]
+
+        ems_mudl = ems*self.pix          # Incident mu.dl per pixel for every angle
+
+        taus = []
+        for i in range(nang):
+            taus.append(tf.nn.conv2d(ems_mudl[0, i:i+1,...,None],   # One angle slice at a time
+                             self.krnl, 
+                             strides=1, padding='SAME'))
+        
+        tau_ems = tf.concat(taus, axis = 0)     # [Nang, H, W, C = 1]
+        tau_ems = tf.clip_by_value(tau_ems, 0.0, 200.0)      #Numerical stability
+        P_out = tf.exp(-tau_ems)
+        
+        # Rotating Reconstruction
+        img = tf.transpose(self.rec, [3, 1, 2, 0])
+        img = tf.tile(img, [nang, 1, 1, 1])
+        img = tfrotate(img, self.ang, interpolation="bilinear")
+
+        # Incidnet attenuation
+        img = tf.math.multiply(img, A_in)
+        
+        # Emission beam attenuation
+        img = tf.math.multiply(img, P_out)
+
+        if self.reduce_mode == 'mean':
+            sino = tf.reduce_mean(img, 2, name=None)
+        elif self.reduce_mode == 'sum':
+            sino = tf.reduce_sum(img, 2, name=None)
+        sino = tf.transpose(sino, [2, 0, 1])
+        sino = tf.reshape(sino, [sino.shape[0], sino.shape[1], sino.shape[2], 1])
+
+        return sino
+
 
 class TensorRadon:
 
