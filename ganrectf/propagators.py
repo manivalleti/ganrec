@@ -67,7 +67,7 @@ class TomoFluoroLIX:
         nang = self.ang.shape[0]
         img = tf.transpose(self.rec, [3, 1, 2, 0])
         img = tf.tile(img, [nang, 1, 1, 1])
-        img = tfrotate(img, self.ang, center = self.cen, interpolation="bilinear")
+        img = tfrotate(img, self.ang, interpolation="bilinear")
 
         if self.Ain is not None:
             img = tf.math.multiply(img, self.Ain)
